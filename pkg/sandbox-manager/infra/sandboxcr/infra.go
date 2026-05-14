@@ -18,6 +18,7 @@ package sandboxcr
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -158,6 +159,7 @@ func (i *Infra) ClaimSandbox(ctx context.Context, opts infra.ClaimSandboxOptions
 		metrics.InitRuntime += tryMetrics.InitRuntime
 		metrics.CSIMount += tryMetrics.CSIMount
 		metrics.LockType = tryMetrics.LockType
+		metrics.MergePickSandboxFailures(tryMetrics.PickSandboxFailures)
 		if tryMetrics.LastError != nil {
 			metrics.LastError = tryMetrics.LastError
 		}
@@ -168,14 +170,22 @@ func (i *Infra) ClaimSandbox(ctx context.Context, opts infra.ClaimSandboxOptions
 		}
 		return claimErr
 	})
-	return claimedSandbox, metrics, buildClaimError(err, metrics.LastError)
+	return claimedSandbox, metrics, buildClaimError(err, metrics.LastError, metrics.PickSandboxFailures)
 }
 
-func buildClaimError(err error, lastError error) error {
+func buildClaimError(err error, lastError error, failures []infra.PickSandboxFailure) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("%v, last error: %v", err, lastError)
+	base := fmt.Sprintf("%v, last error: %v", err, lastError)
+	if len(failures) == 0 {
+		return fmt.Errorf("%s", base)
+	}
+	raw, marshalErr := json.Marshal(failures)
+	if marshalErr != nil {
+		return fmt.Errorf("%s, pick sandbox failures marshal error: %v", base, marshalErr)
+	}
+	return fmt.Errorf("%s, pick sandbox failures: %s", base, string(raw))
 }
 
 func (i *Infra) CloneSandbox(ctx context.Context, opts infra.CloneSandboxOptions) (infra.Sandbox, infra.CloneMetrics, error) {
@@ -205,19 +215,19 @@ func (i *Infra) DeleteCheckpoint(ctx context.Context, opts infra.DeleteCheckpoin
 	}, i.Cache, infra.CloneMetrics{})
 	if err != nil {
 		log.Error(err, "failed to find checkpoint and template")
-		return managererrors.NewError(managererrors.ErrorNotFound, err.Error())
+		return managererrors.NewError(managererrors.ErrorNotFound, "%s", err.Error())
 	}
 
 	// Step 2: Verify ownership if Owner is specified
 	if user := opts.User; user != "" && cp.GetAnnotations()[v1alpha1.AnnotationOwner] != user {
-		return managererrors.NewError(managererrors.ErrorNotAllowed, fmt.Sprintf("checkpoint %s is not owned by user %s", opts.CheckpointID, user))
+		return managererrors.NewError(managererrors.ErrorNotAllowed, "checkpoint %s is not owned by user %s", opts.CheckpointID, user)
 	}
 
 	// Step 3: Delete the SandboxTemplate
 	log.Info("deleting sandbox template", "template", klog.KObj(tmpl))
 	if err := DefaultDeleteSandboxTemplate(ctx, i.Cache.GetClient(), tmpl.Namespace, tmpl.Name); err != nil {
 		log.Error(err, "failed to delete sandbox template")
-		return managererrors.NewError(managererrors.ErrorInternal, err.Error())
+		return managererrors.NewError(managererrors.ErrorInternal, "%s", err.Error())
 	}
 
 	// Step 4: Check if checkpoint has OwnerReference to the SandboxTemplate
@@ -227,7 +237,7 @@ func (i *Infra) DeleteCheckpoint(ctx context.Context, opts infra.DeleteCheckpoin
 		log.Info("checkpoint has no controller reference to template, deleting explicitly", "checkpoint", klog.KObj(cp))
 		if err := DefaultDeleteCheckpointCR(ctx, i.Cache.GetClient(), cp.Namespace, cp.Name); err != nil {
 			log.Error(err, "failed to delete checkpoint")
-			return managererrors.NewError(managererrors.ErrorInternal, err.Error())
+			return managererrors.NewError(managererrors.ErrorInternal, "%s", err.Error())
 		}
 	}
 

@@ -31,8 +31,9 @@ import (
 // reaches a desired state (e.g., sandbox becomes Running after Resume).
 //
 // All Get/List methods read exclusively from the in-process informer store; they never issue
-// live API calls. Run must be called once to start the underlying informers and wait for the
-// initial sync before any other method is used.
+// live API calls. The underlying manager cache must be synced before any other method is used.
+// Call Run for a Cache with an owned manager. When a Cache reuses another operator's manager,
+// do not call Run; the owner manager starts and syncs the cache during manager.Start.
 type Provider interface {
 	GetClaimedSandbox(ctx context.Context, opts GetClaimedSandboxOptions) (*agentsv1alpha1.Sandbox, error)
 
@@ -53,12 +54,18 @@ type Provider interface {
 	ListSandboxesInPool(ctx context.Context, opts ListSandboxesInPoolOptions) ([]*agentsv1alpha1.Sandbox, error)
 
 	// NewSandboxPauseTask builds an immutable wait task encapsulating the Pause
-	// readiness check. See pkg/cache/tasks.go for the checker definition.
-	NewSandboxPauseTask(ctx context.Context, sbx *agentsv1alpha1.Sandbox) *cacheutils.WaitTask[*agentsv1alpha1.Sandbox]
+	// readiness check and pre-acquires its wait hook before callers mutate
+	// spec.paused. Call Release if Wait will not be reached; deferring Release
+	// after successful construction is safe. Wait releases the acquired hook
+	// when it returns.
+	NewSandboxPauseTask(ctx context.Context, sbx *agentsv1alpha1.Sandbox) (*cacheutils.WaitTask[*agentsv1alpha1.Sandbox], error)
 
 	// NewSandboxResumeTask builds an immutable wait task for Resume. The task
-	// succeeds when the sandbox reaches SandboxStateRunning.
-	NewSandboxResumeTask(ctx context.Context, sbx *agentsv1alpha1.Sandbox) *cacheutils.WaitTask[*agentsv1alpha1.Sandbox]
+	// pre-acquires its wait hook before callers mutate spec.paused and succeeds
+	// when the Ready condition is True. Call Release if Wait will not be reached;
+	// deferring Release after successful construction is safe. Wait releases the
+	// acquired hook when it returns.
+	NewSandboxResumeTask(ctx context.Context, sbx *agentsv1alpha1.Sandbox) (*cacheutils.WaitTask[*agentsv1alpha1.Sandbox], error)
 
 	// NewSandboxWaitReadyTask builds an immutable wait task for post-claim
 	// readiness (Generation observed + Ready condition not StartContainerFailed
@@ -70,8 +77,8 @@ type Provider interface {
 	// CheckpointId); fails on Terminating/Failed.
 	NewCheckpointTask(ctx context.Context, cp *agentsv1alpha1.Checkpoint) *cacheutils.WaitTask[*agentsv1alpha1.Checkpoint]
 
-	// Run must be called once before any other Provider method is invoked.
-	// Returns an error if any informer fails to start or if the cache sync times out.
+	// Run starts an owned manager and waits for cache sync.
+	// Do not call Run for a cache backed by an externally owned manager.
 	Run(ctx context.Context) error
 
 	// Stop shuts down all underlying informers and releases associated resources.
